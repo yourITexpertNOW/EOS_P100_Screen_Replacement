@@ -1,145 +1,137 @@
-# EOS P100 Touchscreen Replacement
+# EOS P100 Touchscreen Restoration
 
-**Reverse engineering a proprietary RS232 touch protocol to replace a broken resistive touchscreen on an industrial SLS 3D printer**
+Replacing a failed resistive touchscreen on an EOS P100 industrial SLS 3D printer with a modern panel, using a Raspberry Pi Pico as a real-time serial protocol translator. No original parts, no vendor support, no documentation.
 
----
+The original 12.1 inch touchscreen had a working display but completely dead touch input. Replacement panels for this controller are effectively unobtainable. Rather than scrap a working industrial machine, I reverse engineered the proprietary touch protocol and built a translator that lets a standard modern touchscreen speak to the printer's controller as if it were the original part.
 
-## Overview
-
-The EOS P100 is an industrial selective laser sintering (SLS) 3D printer running a proprietary embedded controller called **Charon**, a TQM5200/MPC5200 PowerPC board running Linux kernel 2.4.25 with Xenomai real-time extensions. The machine uses a resistive touchscreen as its primary interface.
-
-When the original touchscreen failed, there was no direct replacement available. This project replaces it with a modern **iiyama ProLite T1531SR** resistive touchscreen by translating between its USB HID touch protocol (eGalax) and the proprietary serial touch protocol expected by the Charon controller (iRV 5-wire RS232).
-
-A **Raspberry Pi Pico** sits in the middle, reading touch data from the iiyama screen and retransmitting it in the format the Charon controller expects, in real time.
+This write up documents the whole process, including the wrong turns, because the debugging path is the interesting part.
 
 ---
 
-## The problem
+## The result
 
-| Component | Detail |
+A Raspberry Pi Pico sits between a modern iiyama touchscreen and the printer's controller. It reads touch data from the new screen in one protocol, translates it in real time, and outputs it in the format the printer's original controller expects. The printer runs its unmodified factory software and behaves exactly as it did with the original screen.
+
+The final firmware runs standalone. Power on, and it works. No calibration ritual, no host computer.
+
+Final firmware: `touch_translator_v20_standalone.py`
+
+---
+
+## The hardware
+
+| Component | Role |
 |---|---|
-| Machine | EOS P100 SLS printer |
-| Controller | Charon (TQM5200/MPC5200 PowerPC) |
-| Kernel | Linux 2.4.25 with Xenomai |
-| Original touchscreen | Resistive, RS232 (iRV protocol) |
-| Replacement screen | iiyama ProLite T1531SR (USB HID, eGalax controller) |
-| Translator | Raspberry Pi Pico (MicroPython) |
+| EOS P100 SLS printer | The machine being repaired |
+| Original controller (PowerPC, embedded Linux, kernel 2.4.x) | Runs the factory print software, expects a specific serial touch protocol |
+| iiyama ProLite T1531SR | Modern replacement touchscreen, outputs a different serial protocol |
+| Raspberry Pi Pico (RP2040, MicroPython) | The translator sitting between the two |
+| RS232 level adapters | Interfacing the serial links |
 
-The Charon controller reads touch data from a serial port expecting the iRV protocol. The replacement screen outputs USB HID. These are fundamentally incompatible, and the Pico bridges them.
-
----
-
-## Protocol discovery
-
-The key challenge was that the iRV protocol was undocumented. Protocol analysis was done by sniffing traffic from a working EOS P110 (which uses the same controller family) and comparing byte patterns from different touch positions.
-
-### The 10-bit breakthrough
-
-Early firmware versions (v1 through v9) could only reach the central third of the 800x600 screen. The root cause was a wrong assumption about coordinate bit depth.
-
-The iRV protocol uses 5-byte packets. The status bytes (byte 1 and byte 3) were initially assumed to be pure status flags since they only ever held four values: `0x00`, `0x40`, `0x80`, `0xC0`. In reality, they carry the **top 2 bits** of each coordinate:
-
-```
-Full X = ((byte1 >> 6) << 8) | byte2   -> 0 to 1023 range
-Full Y = ((byte3 >> 6) << 8) | byte4   -> 0 to 1023 range
-```
-
-This gives a 10-bit coordinate space (0 to 1023) rather than the 8-bit range (0 to 255) previously assumed. The Charon calibration system (`/etc/pointercal`) expects raw values spanning approximately -260 to +628 across the screen, a range that only the full 10-bit space can satisfy.
-
-Implementing 10-bit encoding in `touch_translator_v10_10bit.py` immediately opened up the full screen.
+The Pico uses two UART channels: one reading the new screen, one writing to the controller.
 
 ---
 
-## Calibration system
+## The problem in one line
 
-The Charon controller uses tslib for touchscreen calibration. Calibration data is stored in a 7-parameter file:
+Two touchscreens, two completely different and partly undocumented serial protocols, and a controller that only understands one of them.
 
-```
-a b c d e f s
-```
+To make the translator I had to fully understand both:
 
-Where the coordinate transform is: `X_screen = (a * X_raw + b * Y_raw + c) / s`
+- **The input protocol** the modern iiyama screen speaks
+- **The output protocol** the printer's original screen used to speak
 
-### P100-specific findings
-
-- `/etc/pointercal` is a **symlink** to `/home/eos/config/pointercal2` (not `pointercal` as assumed from P110 behaviour)
-- The P100 only writes calibration data when the on-screen OK button is explicitly pressed, unlike the P110 which writes live during the 5-point sequence
-- Factory default backup at `/etc/defaultconfig/pointercal`:
-  ```
-  54720 0 14235840 -80 42560 10958800 60720
-  ```
-- Sanity check for valid calibration: compute `a/s` (should be around 0.88) and `e/s` (should be around 0.70). A ratio of 7.69 or `s=0` indicates a corrupted result, restore from factory default
-
-### Orientation
-
-The P100 requires:
-```python
-INVERT_X = True
-INVERT_Y = True
-SWAP_XY  = False
-```
+Neither was documented. Both had to be recovered from captured serial data.
 
 ---
 
-## Firmware versions
+## Reverse engineering the protocols
 
-| Version | Key change |
+### Gaining access
+
+Root access to the controller was obtained through its serial console. From there I could inspect the touch input device, the calibration files, and the Qt based touch driver the factory software uses. Access details and credentials are redacted in this public write up.
+
+Key discovery: the controller reads touch input from a serial port using a proprietary parser, and stores calibration as a 7 value transformation matrix (the standard tslib `pointercal` format) that maps raw touch coordinates onto screen pixels.
+
+### Capturing the original protocol
+
+By capturing the serial output of a working original screen on an identical machine, I recovered the output protocol: a repeating fixed length binary packet per touch, with a distinct release sequence. Early analysis suggested the coordinates were encoded across multiple bytes, and this is where the first long detour began.
+
+### The input protocol
+
+The iiyama screen outputs a 5 byte binary frame per touch sample. Recovering the exact bit layout took several attempts and produced two of the most important lessons in the whole project (below).
+
+---
+
+## The trial and error, honestly
+
+This project took many firmware iterations. Almost every assumption I made about the protocols was wrong at least once. The versions below trace the actual path.
+
+### Diagnostic tooling
+
+Before the translator could be trusted, I wrote a set of throwaway diagnostic scripts. These turned out to be the most valuable code in the project:
+
+- **Raw packet sniffers** that printed the actual bytes coming off each screen, with no interpretation. Every real breakthrough came from staring at raw bytes rather than decoded values. I should have reached for these far earlier than I did.
+- **Constant packet and constant tap tests** that sent a single fixed synthetic touch repeatedly, to prove whether the controller framed and parsed our output deterministically, separate from any touch noise.
+- **A diagnostic calibration** (a simple known linear `pointercal`) that let me read back exactly where the controller thought a touch had landed, giving ground truth to check the translator against.
+
+### Screen and button mapping
+
+Because the controller's on screen cursor is only intermittently visible on the normal menus (this is normal behaviour for this hardware), I could not judge accuracy by eye reliably. So I mapped it empirically instead: sending fixed synthetic touches and recording which on screen buttons they activated, building up a coordinate map of the interface. This mapping later drove a synthetic navigation system that could press menu buttons programmatically.
+
+A key insight from this stage: synthetic fixed touches are perfect for navigating menus, but the actual calibration points must be captured from a real finger, otherwise you calibrate the screen to invented numbers rather than to the physical panel.
+
+### The wrong turns worth documenting
+
+**The multi byte coordinate theory.** I spent a long time convinced the output coordinates used a wide numeric range packed across status bytes. It partly fit the evidence, so it survived far longer than it should have.
+
+**The byte order bug.** The single deepest bug in the project. The input decode had the high and low bytes of each coordinate swapped. The proof came from a slow finger drag: at a 7 bit boundary the values jumped discontinuously (for example 16270 straight to 15) under the wrong decode, but incremented smoothly by one under the correct decode. A finger moving smoothly cannot produce a discontinuous jump, so the smooth version had to be right. This one bug had been generating what looked like random cursor glitches, and every noise filter I had written was treating the symptom rather than the cause.
+
+**The range assumption.** Even with the bytes correct, calibration would not land. Measuring full panel drags showed the two axes covered very different numeric ranges, so a single scale factor distorted one of them. I moved to independent per axis scaling, and then to a firmware routine that learns each axis range automatically from a panel wipe, which removed the guesswork.
+
+### The breakthrough
+
+After all of that, calibration still would not settle. The touches were decoded correctly, smooth, and full range, yet the calibration never matched the screen.
+
+The answer was hiding in my own mapping data. Every on screen coordinate I had ever recorded, every button, every calibration target, fell within a small numeric range. The original screen had effectively used a much smaller coordinate resolution than I had been outputting. I had been scaling touches to a range many times larger than the controller's calibration expected, so all but a sliver of the output landed off screen.
+
+Rescaling the translator output to match the original screen's native coordinate range was the fix. The controller's calibration maths, unchanged, suddenly worked. From there a normal 5 point calibration completed cleanly and the screen tracked accurately across its whole surface.
+
+The lesson: the simplest explanation, that the numbers were simply the wrong size, was sitting in the data the whole time.
+
+---
+
+## Firmware progression
+
+| Version | Change |
 |---|---|
-| v1 to v9 | 8-bit coordinate encoding, could only reach central third of screen |
-| v10 | 10-bit encoding implemented, full screen coverage achieved |
-| v11 to v12 | Warmup/stability gating added, over-filtered centre touches |
-| **v13** | **Current stable.** `warmup=1`, `outlier_tol=200`, `smooth_window=5` |
-
-The current translator firmware is `touch_translator_v13.py`.
-
----
-
-## Calibration assistant
-
-Because the 5-point calibration sequence involves pressing a small moving OK button that is difficult to hit reliably with a translated touch, a dedicated calibration assistant was written.
-
-`calibration_assistant_v2.py` combines synthetic taps (sent programmatically) for menu navigation with a sample-and-hold physical touch mode for the 5 calibration points.
-
-The sequence is BOOTSEL-button driven:
-1. Press to synthetic tap: Service menu (34, 68)
-2. Press to synthetic tap: Touchscreen calibration entry (148, 203)
-3. Press to synthetic tap: Calibration start (~210, 80) - **requires field verification**
-4. Press to enter sample-and-hold mode: physically touch each of the 5 calibration points, BOOTSEL to confirm each
-5. Press to synthetic tap: OK button (80, 96) as a fallback once calibration is confirmed good
-
----
-
-## Current status
-
-| Stage | Status |
-|---|---|
-| Protocol analysis (iRV 10-bit) | Complete |
-| Screen mapping (button coordinates) | Complete |
-| Stable translator firmware (v13) | Complete |
-| Calibration assistant v2 | Written |
-| START_CAL_XY field verification (~210,80) | Pending, needs in-person test on P100 |
-| Full calibration achieved and verified | Pending |
-
----
-
-## Tools and hardware
-
-- Raspberry Pi Pico (MicroPython)
-- iiyama ProLite T1531SR resistive touchscreen
-- RS232 serial adapter
-- SSH access to EOS P100 Charon controller
-- Python scripts for log analysis and coordinate mapping
+| Early versions | Initial translator, multi byte coordinate theory, heavy noise filtering |
+| Byte order fix | Corrected the swapped high/low bytes in the input decode |
+| Per axis scaling | Independent X and Y ranges instead of one shared scale |
+| Auto range learning | Firmware learns each axis range from a panel wipe |
+| Output range fix | Rescaled output to the original screen's native range. This is what made calibration work |
+| `touch_translator_v20_standalone.py` | Final. Hardcoded panel range, no boot time setup, runs standalone |
 
 ---
 
 ## What I learned
 
-- Reverse engineering an undocumented binary serial protocol from packet captures
-- Embedded Linux debugging on old constrained hardware (PowerPC, kernel 2.4)
-- MicroPython firmware development for the RP2040
-- Signal processing concepts applied to noisy resistive touch data including outlier rejection, smoothing windows, and sample-and-hold input
-- The importance of empirical testing, as every assumption about the protocol turned out to be wrong at least once
+- Reverse engineering two undocumented binary serial protocols from packet captures
+- Embedded Linux work on old, constrained hardware (PowerPC, kernel 2.4.x)
+- MicroPython firmware development on the RP2040, including dual UART real time translation
+- Applying signal processing ideas (outlier rejection, median smoothing, sample and hold) to noisy resistive touch data
+- Reading raw bytes instead of trusting decoded values, and reaching for that far sooner
+- That the obvious, simplest explanation deserves testing first, not last
 
 ---
 
-*Project is ongoing. Updates added as calibration work progresses.*
+## Repository contents
+
+- `touch_translator_v20_standalone.py` — final production firmware
+- `diagnostics/` — the raw sniffers and constant tap tests used to recover the protocols
+- `history/` — earlier firmware versions, kept to show the debugging progression
+- `WORKING_CONFIG.md` — the working configuration, with security sensitive values redacted
+
+---
+
+*Industrial repair project. All controller access credentials, network addresses, and machine identifiers have been redacted from this public write up.*
